@@ -1,0 +1,49 @@
+name: Publish Images
+
+on:
+  push:
+    branches: ["main"]
+    paths: ["images/**"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image_name: [caddy-cloudflare]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version and prep metadata
+        id: prep
+        run: |
+          V_CONTENT=$(cat images/${{ matrix.image_name }}/VERSION)
+          echo "VERSION=${V_CONTENT}" >> $GITHUB_OUTPUT
+          echo "REPO_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./images/${{ matrix.image_name }}
+          build-args: |
+            CADDY_VERSION=${{ steps.prep.outputs.VERSION }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.prep.outputs.REPO_LC }}/forge/${{ matrix.image_name }}:latest
+            ${{ env.REGISTRY }}/${{ steps.prep.outputs.REPO_LC }}/forge/${{ matrix.image_name }}:${{ steps.prep.outputs.VERSION }}
