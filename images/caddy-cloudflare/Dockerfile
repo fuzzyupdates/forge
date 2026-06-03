@@ -1,6 +1,5 @@
 # images/caddy-cloudflare/Dockerfile
-# Define the version globally. Defaulting to 2.11 for 2026 stability.
-ARG CADDY_VERSION=2.11.3
+ARG CADDY_VERSION=2.11.4
 
 # Stage 1: Build
 FROM caddy:${CADDY_VERSION}-builder AS builder
