@@ -175,8 +175,10 @@ if ((${#IMG_DIRS[@]})); then
 				echo "FAIL  images/$name/VERSION: '$v' is not bare semver (digits.digits.digits, no leading v)"
 				dir_fail=1
 			fi
-			# comments cannot satisfy a structural check
-			nocomment=$(grep -v '^[[:space:]]*#' "${d}Dockerfile")
+			# comments and blank lines carry no structure; dropping them
+			# before joining also defeats blank-line-in-continuation tricks
+			# (Docker skips blank lines inside continuations, sed-join does not)
+			nocomment=$(grep -vE '^[[:space:]]*(#|$)' "${d}Dockerfile")
 			# join line continuations so structural checks see logical lines
 			joined=$(sed -e ':a' -e '/\\$/N' -e 's/\\\n[[:space:]]*/ /' -e 'ta' <<<"$nocomment")
 			if ! grep -qiE '^[[:space:]]*FROM.*[$][{]CADDY_VERSION[}]' <<<"$joined"; then
@@ -188,7 +190,10 @@ if ((${#IMG_DIRS[@]})); then
 			while IFS= read -r ref; do
 				[[ -n "$ref" ]] || continue
 				# shellcheck disable=SC2016  # literal ${CADDY_VERSION}, must not expand
-				if [[ "${ref,,}" =~ (^|.*/)caddy: ]] && [[ "$ref" != *'${CADDY_VERSION}'* ]]; then
+				if [[ "$ref" == '${'* || "$ref" == '$('* ]]; then
+					echo "FAIL  images/$name: FROM ref '$ref' is a bare variable — the base is unresolvable to the gate"
+					dir_fail=1
+				elif [[ "${ref,,}" =~ (^|/)caddy([:@]|$) ]] && [[ "$ref" != *'${CADDY_VERSION}'* ]]; then
 					echo "FAIL  images/$name: FROM base '$ref' is not riding \${CADDY_VERSION} — literal or floating caddy tags are silent drift"
 					dir_fail=1
 				fi
@@ -215,8 +220,8 @@ if ((${#IMG_DIRS[@]})); then
 			while IFS= read -r mod; do
 				[[ -n "$mod" ]] || continue
 				mod_count=$((mod_count + 1))
-				if ! [[ "$mod" =~ @v[0-9] ]]; then
-					echo "FAIL  images/$name: xcaddy module '$mod' is unpinned — rebuilds can change bytes"
+				if ! [[ "$mod" =~ ^[^@=[:space:]]+@v[0-9][^@=[:space:]]*$ ]]; then
+					echo "FAIL  images/$name: xcaddy module '$mod' is unpinned or replaced — rebuilds can change bytes"
 					dir_fail=1
 				fi
 			done < <(grep -oE -- '--with[[:space:]]+[^[:space:]]+' <<<"$joined" |
