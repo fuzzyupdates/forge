@@ -23,10 +23,13 @@ docker pull ghcr.io/fuzzyupdates/forge/caddy-cloudflare:2.11.7
 
 - `images/<name>/VERSION` pins the upstream Caddy release. CI passes it to the
   build as `CADDY_VERSION` and the published image is tagged with it.
+- DNS plugins are pinned too (`@v` on each xcaddy `--with` module), so the
+  same Caddy version always builds the same bytes.
 - When Caddy releases, a bump PR changes `VERSION` (and the Dockerfile `ARG`
   default, which the gate keeps in sync). CI builds the image and verifies the
-  built binary reports the pinned version; publishing on `main` re-runs the
-  same assertion before pushing to the registry.
+  built binary reports the pinned version and includes the DNS module; on
+  `main` the gate and verification run again and the verified artifact is
+  pushed as-is — publishing never ships a second, unverified build.
 
 ## Development
 

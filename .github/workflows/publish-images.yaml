@@ -15,10 +15,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  gate:
+    # run the full check.sh gate before anything publishes — publish runs on
+    # push events too, so a direct merge to main must not skip the gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install pinned gate tools
+        uses: ./.github/actions/gate-tools
+      - name: Style gate
+        run: ./check.sh
+
   build-and-push:
-    # publish ONLY from main — this also blocks workflow_dispatch against an
-    # unreviewed branch, which would otherwise overwrite :latest with
-    # unreviewed content
+    # publish ONLY from main. NOTE: workflow_dispatch snapshots the workflow
+    # from the dispatched ref — this ref check, not the trigger, is what keeps
+    # a dispatch against an unreviewed branch from overwriting :latest.
+    needs: gate
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -31,6 +47,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Read version and prep metadata
         id: prep
@@ -47,7 +65,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build (push:false — verify before anything lands in the registry)
+      - name: Build and load (no push — verify the exact artifact before it lands in the registry)
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ./images/${{ matrix.image_name }}
@@ -57,7 +75,7 @@ jobs:
           load: true
           tags: forge-publish-verify:${{ matrix.image_name }}
 
-      - name: Verify built binary reports the pinned version
+      - name: Verify the loaded artifact
         env:
           IMAGE_NAME: ${{ matrix.image_name }}
           EXPECTED: ${{ steps.prep.outputs.VERSION }}
@@ -70,14 +88,21 @@ jobs:
             echo "built binary reports '$first', want 'v$EXPECTED'" >&2
             exit 1
           fi
+          mods=$(docker run --rm --entrypoint caddy "forge-publish-verify:$IMAGE_NAME" list-modules)
+          grep -qx 'dns.providers.cloudflare' <<<"$mods"
 
-      - name: Push (layers come from the verified build's cache)
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: ./images/${{ matrix.image_name }}
-          build-args: |
-            CADDY_VERSION=${{ steps.prep.outputs.VERSION }}
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ steps.prep.outputs.REPO_LC }}/forge/${{ matrix.image_name }}:latest
-            ${{ env.REGISTRY }}/${{ steps.prep.outputs.REPO_LC }}/forge/${{ matrix.image_name }}:${{ steps.prep.outputs.VERSION }}
+      - name: Push the verified artifact
+        env:
+          IMAGE_NAME: ${{ matrix.image_name }}
+          VERSION: ${{ steps.prep.outputs.VERSION }}
+          REPO_LC: ${{ steps.prep.outputs.REPO_LC }}
+        run: |
+          set -euo pipefail
+          # tag and push the exact loaded artifact — a second build-push would
+          # publish a fresh build, not the one that was verified
+          src="forge-publish-verify:$IMAGE_NAME"
+          dst="$REGISTRY/$REPO_LC/forge/$IMAGE_NAME"
+          docker tag "$src" "$dst:latest"
+          docker tag "$src" "$dst:$VERSION"
+          docker push "$dst:latest"
+          docker push "$dst:$VERSION"

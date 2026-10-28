@@ -7,7 +7,7 @@ FROM caddy:${CADDY_VERSION}-builder AS builder
 ARG CADDY_VERSION
 # We use v${CADDY_VERSION} to ensure xcaddy gets the proper git tag format
 RUN xcaddy build v${CADDY_VERSION} \
-    --with github.com/caddy-dns/cloudflare \
+    --with github.com/caddy-dns/cloudflare@v0.2.4 \
     --output /usr/bin/caddy
 
 # Stage 2: Final Image

@@ -95,42 +95,60 @@ else
 fi
 
 # --- image directory invariants --------------------------------------------
-# For every images/<name>/ directory (name: lowercase-safe, no dot-dirs):
+# For every images/<name>/ directory (name: OCI-repository-component safe):
 #  * VERSION and Dockerfile must exist;
 #  * VERSION must be bare semver (publish tags caddy:${VERSION}-builder,
 #    which has no "v" prefix);
-#  * EVERY `ARG CADDY_VERSION=` default (any case/indent, quotes and trailing
-#    comments tolerated) must equal VERSION — CI always passes the build arg,
-#    so a stale default is silent drift — and the Dockerfile must actually
-#    consume ${CADDY_VERSION};
-#  * <name> must be an exact element of the publish workflow's image_name
-#    matrix (substring matching would let images/caddy ride along on
-#    caddy-cloudflare), or a new image silently never publishes.
+#  * EVERY `ARG CADDY_VERSION=` default on an uncommented line (any case and
+#    indent, quotes and trailing comments tolerated) must equal VERSION — CI
+#    always passes the build arg, so a stale default is silent drift. A
+#    line-continued ARG declaration fails: the drift loop cannot read it.
+#    ${CADDY_VERSION} must be consumed by a FROM line (comments don't count);
+#  * every xcaddy `--with` module must carry an explicit @v pin — an unpinned
+#    module floats, so the same Caddy version can build different bytes;
+#  * <name> must be an exact element of the publish matrix AND every matrix
+#    member must have a directory; a matrix line whose list is empty fails
+#    (an empty list would skip membership and never publish anything).
 PUBLISH=".github/workflows/publish-images.yaml"
 shopt -s nullglob
 IMG_DIRS=(images/*/)
+NAME_RE='^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*$'
 if ((${#IMG_DIRS[@]})); then
+	matrix_ok=0
 	if [[ ! -f "$PUBLISH" ]]; then
 		echo "FAIL  $PUBLISH missing — no image can publish"
 		fail=1
-	fi
-	# exact element list from the (single) inline flow-array matrix line
-	matrix_members=""
-	if [[ -f "$PUBLISH" ]]; then
+	else
+		# exact element list from the (single) inline flow-array matrix line
 		matrix_line=$(grep -E '^[[:space:]]*image_name:[[:space:]]*\[' "$PUBLISH" | head -n1 || true)
 		if [[ -z "$matrix_line" ]]; then
 			echo "FAIL  $PUBLISH: no 'image_name: [...]' matrix line"
 			fail=1
 		else
 			matrix_members=$(sed -E 's/^[^[]*\[(.*)\].*/\1/' <<<"$matrix_line" |
-				tr ',' '\n' | sed -E 's/^[[:space:]"'"'"']+//; s/[[:space:]"'"'"']+$//')
+				tr ',' '\n' | sed -E "s/^[[:space:]\"']+//; s/[[:space:]\"']+$//")
+			if [[ -z "$(tr -d '[:space:]' <<<"$matrix_members")" ]]; then
+				echo "FAIL  $PUBLISH: image_name matrix is empty — nothing would ever publish"
+				fail=1
+			else
+				matrix_ok=1
+				# reverse membership: a matrix entry without a directory
+				# passes PR builds but breaks publish on main
+				while IFS= read -r m; do
+					[[ -n "$m" ]] || continue
+					if [[ ! -d "images/$m" ]]; then
+						echo "FAIL  matrix entry '$m' has no images/$m directory"
+						fail=1
+					fi
+				done <<<"$matrix_members"
+			fi
 		fi
 	fi
 	for d in "${IMG_DIRS[@]}"; do
 		name="$(basename -- "$d")"
 		dir_fail=0
-		if ! [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
-			echo "FAIL  images/$name: dir name must match ^[a-z0-9][a-z0-9._-]*\$ (CI matrix safety)"
+		if ! [[ "$name" =~ $NAME_RE ]]; then
+			echo "FAIL  images/$name: dir name must match $NAME_RE (GHCR/CI matrix safety)"
 			dir_fail=1
 		fi
 		if [[ ! -f "${d}VERSION" ]]; then
@@ -147,22 +165,43 @@ if ((${#IMG_DIRS[@]})); then
 				echo "FAIL  images/$name/VERSION: '$v' is not bare semver (digits.digits.digits, no leading v)"
 				dir_fail=1
 			fi
-			if ! grep -q 'CADDY_VERSION}' "${d}Dockerfile"; then
-				echo "FAIL  images/$name: Dockerfile never uses \${CADDY_VERSION} — the pin is decoration"
+			# comments cannot satisfy a structural check
+			nocomment=$(grep -v '^[[:space:]]*#' "${d}Dockerfile")
+			if ! grep -qE '^FROM.*[$][{]CADDY_VERSION[}]' <<<"$nocomment"; then
+				echo "FAIL  images/$name: CADDY_VERSION not consumed by a FROM line — the pin is decoration"
+				dir_fail=1
+			fi
+			# every caddy base must ride the pin; a literal tag on any FROM
+			# is silent drift the builder-stage check would mask
+			if grep -qE '^FROM[[:space:]]+caddy:[0-9]' <<<"$nocomment"; then
+				echo "FAIL  images/$name: FROM pins a caddy base by literal version tag — use \${CADDY_VERSION}"
+				dir_fail=1
+			fi
+			if grep -qiE '^[[:space:]]*arg[[:space:]].*\\[[:space:]]*$' <<<"$nocomment"; then
+				echo "FAIL  images/$name: line-continued ARG declaration — the drift check cannot read it"
 				dir_fail=1
 			fi
 			# every ARG default declaration must equal VERSION (no silent skips)
 			while IFS= read -r ad; do
 				ad="${ad#*=}"
 				ad="${ad%$'\r'}"
-				ad=$(sed -E 's/[[:space:]]*(#.*)?$//; s/^["'"'"']//; s/["'"'"']$//' <<<"$ad")
+				ad=$(sed -E "s/[[:space:]]*(#.*)?$//; s/^[\"']//; s/[\"']$//" <<<"$ad")
 				if [[ "$ad" != "$v" ]]; then
 					echo "FAIL  images/$name: Dockerfile ARG default '$ad' != VERSION '$v'"
 					dir_fail=1
 				fi
-			done < <(grep -iE '^[[:space:]]*arg[[:space:]]+CADDY_VERSION=' "${d}Dockerfile" || true)
+			done < <(grep -iE '^[[:space:]]*arg[[:space:]]+CADDY_VERSION=' <<<"$nocomment" || true)
+			# every xcaddy --with module must be explicitly pinned
+			while IFS= read -r mod; do
+				[[ -n "$mod" ]] || continue
+				if [[ "$mod" != *@v* ]]; then
+					echo "FAIL  images/$name: xcaddy module '$mod' is unpinned — rebuilds can change bytes"
+					dir_fail=1
+				fi
+			done < <(grep -oE -- '--with[[:space:]]+[^[:space:]\\]+' "${d}Dockerfile" |
+				sed -E 's/^--with[[:space:]]+//' || true)
 		fi
-		if [[ -n "$matrix_members" ]] && ! grep -qxF -- "$name" <<<"$matrix_members"; then
+		if ((matrix_ok)) && ! grep -qxF -- "$name" <<<"$matrix_members"; then
 			echo "FAIL  images/$name not an exact element of the $PUBLISH image_name matrix — it would never publish"
 			dir_fail=1
 		fi
@@ -173,7 +212,6 @@ if ((${#IMG_DIRS[@]})); then
 		fi
 	done
 fi
-
 if [[ $fail -ne 0 ]]; then
 	echo
 	echo "Style gate FAILED. Run ./check.sh --fix for auto-fixable issues,"
