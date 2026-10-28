@@ -11,77 +11,111 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # never cancel a main-push gate run: every commit on main needs a
+  # recorded result; PR gates may cancel superseded runs
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   style:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 
-      - name: Install tools (versions pinned to match docs/CONTRIBUTING.md)
+      - name: Install pinned tools (versions + sha256 must match docs/CONTRIBUTING.md)
         run: |
+          set -euo pipefail
           mkdir -p "$HOME/.local/bin"
-          curl -sSL -o "$HOME/.local/bin/hadolint" \
+          cd "$HOME/.local/bin"
+          curl -fsSL --retry 3 -O \
             https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64
-          curl -sSL -o "$HOME/.local/bin/shellcheck.txz" \
+          # checksums stored in sha256:<hex> label form (matches how the GitHub
+          # assets API publishes digests); label stripped for sha256sum -c
+          echo 'sha256:c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507  hadolint-linux-x86_64' | sed -E 's/^sha256://' | sha256sum -c
+          mv hadolint-linux-x86_64 hadolint
+          curl -fsSL --retry 3 -O \
             https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
-          tar -xf "$HOME/.local/bin/shellcheck.txz" -C /tmp
-          cp /tmp/shellcheck-v0.11.0/shellcheck "$HOME/.local/bin/"
-          curl -sSL -o "$HOME/.local/bin/shfmt" \
+          echo 'sha256:8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  shellcheck-v0.11.0.linux.x86_64.tar.xz' | sed -E 's/^sha256://' | sha256sum -c
+          tar -xf shellcheck-v0.11.0.linux.x86_64.tar.xz shellcheck-v0.11.0/shellcheck
+          mv shellcheck-v0.11.0/shellcheck .
+          rmdir shellcheck-v0.11.0
+          curl -fsSL --retry 3 -O \
             https://github.com/mvdan/sh/releases/download/v3.11.0/shfmt_v3.11.0_linux_amd64
-          curl -sSL -o "$HOME/.local/bin/actionlint.tgz" \
+          echo 'sha256:1904ec6bac715c1d05cd7f6612eec8f67a625c3749cb327e5bfb4127d09035ff  shfmt_v3.11.0_linux_amd64' | sed -E 's/^sha256://' | sha256sum -c
+          mv shfmt_v3.11.0_linux_amd64 shfmt
+          curl -fsSL --retry 3 -O \
             https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
-          tar -xzf "$HOME/.local/bin/actionlint.tgz" -C "$HOME/.local/bin" actionlint
-          chmod +x "$HOME/.local/bin/hadolint" "$HOME/.local/bin/shfmt" "$HOME/.local/bin/actionlint"
+          echo 'sha256:8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint_1.7.12_linux_amd64.tar.gz' | sed -E 's/^sha256://' | sha256sum -c
+          tar -xzf actionlint_1.7.12_linux_amd64.tar.gz actionlint
+          rm -f shellcheck-v0.11.0.linux.x86_64.tar.xz actionlint_1.7.12_linux_amd64.tar.gz
+          chmod +x hadolint shellcheck shfmt actionlint
+          # the binaries must BE the pinned versions (a stale PATH copy may not
+          # impersonate one)
+          ./hadolint --version | grep -q '2\.15\.1'
+          ./shellcheck --version | grep -q 'version: 0\.11\.0'
+          ./shfmt --version | grep -q 'v3\.11\.0'
+          ./actionlint --version | grep -q '1\.7\.12'
 
       - name: Style gate
         run: ./check.sh
 
   detect-images:
     # The images/ directory is the single source of truth for what must build;
-    # no matrix list here to drift from.
+    # no matrix list here to drift from. Names are validated before becoming
+    # matrix entries (they are later expanded into run: shell contexts).
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       images: ${{ steps.detect.outputs.images }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 
       - id: detect
         run: |
-          images=$(find images -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | jq -R . | jq -sc .)
-          if [[ "$(jq length <<<"$images")" -eq 0 ]]; then
+          set -euo pipefail
+          names=()
+          while IFS= read -r d; do
+            name="${d##*/}"
+            if ! [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+              echo "invalid image directory name: '$name'" >&2
+              exit 1
+            fi
+            names+=("$name")
+          done < <(find images -mindepth 1 -maxdepth 1 -type d | sort)
+          if [[ ${#names[@]} -eq 0 ]]; then
             echo "no image directories found under images/" >&2
             exit 1
           fi
+          images=$(printf '%s\n' "${names[@]}" | jq -R . | jq -sc .)
           echo "images=$images" >> "$GITHUB_OUTPUT"
           echo "will build: $images"
 
   build:
     # PR-time proof the Dockerfiles actually build and the binary reports the
-    # pinned version. Never pushes; publish-images.yaml owns publishing on main.
-    needs: [detect-images]
+    # pinned version. Never pushes; publish-images.yaml owns publishing on
+    # main. needs: style so VERSION is semver-validated before it is used.
+    needs: [style, detect-images]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       matrix:
         image_name: ${{ fromJSON(needs.detect-images.outputs.images) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 
       - name: Read version
         id: prep
-        run: echo "VERSION=$(tr -d '[:space:]' < images/${{ matrix.image_name }}/VERSION)" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE_NAME: ${{ matrix.image_name }}
+        run: echo "VERSION=$(tr -d '[:space:]' <"images/$IMAGE_NAME/VERSION")" >> "$GITHUB_OUTPUT"
 
       - name: Build (no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ./images/${{ matrix.image_name }}
           build-args: |
@@ -91,10 +125,15 @@ jobs:
           tags: forge-pr-check:${{ matrix.image_name }}
 
       - name: Verify built binary reports the pinned version
+        env:
+          IMAGE_NAME: ${{ matrix.image_name }}
+          EXPECTED: ${{ steps.prep.outputs.VERSION }}
         run: |
-          out=$(docker run --rm forge-pr-check:${{ matrix.image_name }} version)
-          echo "$out"
-          if ! grep -q "v${{ steps.prep.outputs.VERSION }}" <<<"$out"; then
-            echo "caddy version output does not contain v${{ steps.prep.outputs.VERSION }}" >&2
+          set -euo pipefail
+          out=$(docker run --rm --entrypoint caddy "forge-pr-check:$IMAGE_NAME" version)
+          printf '%s\n' "$out"
+          first=$(head -n1 <<<"$out" | awk '{print $1}')
+          if [[ "$first" != "v$EXPECTED" ]]; then
+            echo "built binary reports '$first', want 'v$EXPECTED'" >&2
             exit 1
           fi
