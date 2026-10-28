@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# least-privilege: checks only read the tree; the PR build never pushes
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install tools (versions pinned to match docs/CONTRIBUTING.md)
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL -o "$HOME/.local/bin/hadolint" \
+            https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64
+          curl -sSL -o "$HOME/.local/bin/shellcheck.txz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          tar -xf "$HOME/.local/bin/shellcheck.txz" -C /tmp
+          cp /tmp/shellcheck-v0.11.0/shellcheck "$HOME/.local/bin/"
+          curl -sSL -o "$HOME/.local/bin/shfmt" \
+            https://github.com/mvdan/sh/releases/download/v3.11.0/shfmt_v3.11.0_linux_amd64
+          curl -sSL -o "$HOME/.local/bin/actionlint.tgz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          tar -xzf "$HOME/.local/bin/actionlint.tgz" -C "$HOME/.local/bin" actionlint
+          chmod +x "$HOME/.local/bin/hadolint" "$HOME/.local/bin/shfmt" "$HOME/.local/bin/actionlint"
+
+      - name: Style gate
+        run: ./check.sh
+
+  detect-images:
+    # The images/ directory is the single source of truth for what must build;
+    # no matrix list here to drift from.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.detect.outputs.images }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - id: detect
+        run: |
+          images=$(find images -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | jq -R . | jq -sc .)
+          if [[ "$(jq length <<<"$images")" -eq 0 ]]; then
+            echo "no image directories found under images/" >&2
+            exit 1
+          fi
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "will build: $images"
+
+  build:
+    # PR-time proof the Dockerfiles actually build and the binary reports the
+    # pinned version. Never pushes; publish-images.yaml owns publishing on main.
+    needs: [detect-images]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image_name: ${{ fromJSON(needs.detect-images.outputs.images) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: prep
+        run: echo "VERSION=$(tr -d '[:space:]' < images/${{ matrix.image_name }}/VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./images/${{ matrix.image_name }}
+          build-args: |
+            CADDY_VERSION=${{ steps.prep.outputs.VERSION }}
+          push: false
+          load: true
+          tags: forge-pr-check:${{ matrix.image_name }}
+
+      - name: Verify built binary reports the pinned version
+        run: |
+          out=$(docker run --rm forge-pr-check:${{ matrix.image_name }} version)
+          echo "$out"
+          if ! grep -q "v${{ steps.prep.outputs.VERSION }}" <<<"$out"; then
+            echo "caddy version output does not contain v${{ steps.prep.outputs.VERSION }}" >&2
+            exit 1
+          fi
