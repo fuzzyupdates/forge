@@ -95,24 +95,32 @@ else
 fi
 
 # --- image directory invariants --------------------------------------------
-# For every images/<name>/ directory (name: OCI-repository-component safe):
+# For every images/<name>/ directory (found via find, so hidden dirs are
+# gated locally exactly as CI sees them):
 #  * VERSION and Dockerfile must exist;
-#  * VERSION must be bare semver (publish tags caddy:${VERSION}-builder,
-#    which has no "v" prefix);
-#  * EVERY `ARG CADDY_VERSION=` default on an uncommented line (any case and
-#    indent, quotes and trailing comments tolerated) must equal VERSION — CI
-#    always passes the build arg, so a stale default is silent drift. A
-#    line-continued ARG declaration fails: the drift loop cannot read it.
-#    ${CADDY_VERSION} must be consumed by a FROM line (comments don't count);
-#  * every xcaddy `--with` module must carry an explicit @v pin — an unpinned
-#    module floats, so the same Caddy version can build different bytes;
-#  * <name> must be an exact element of the publish matrix AND every matrix
-#    member must have a directory; a matrix line whose list is empty fails
-#    (an empty list would skip membership and never publish anything).
+#  * dir name matches the OCI repository-component rule;
+#  * VERSION must be bare semver (publish tags caddy:${VERSION}-builder);
+#  * every uncommented CADDY_VERSION= assignment on an ARG line must equal
+#    VERSION (any case, any position inside a multi-name ARG); a
+#    line-continued ARG declaration fails: the drift loop cannot read it;
+#  * at least one FROM consumes ${CADDY_VERSION}, and EVERY caddy base
+#    (any case, any registry prefix, any tag form) must ride it — a literal
+#    or floating tag is silent drift the version assert cannot catch, since
+#    the binary comes from the builder stage;
+#  * every xcaddy --with module carries an explicit @v<digit> pin; checks
+#    run on line continuations JOINED, so splitting --with across lines
+#    cannot hide a floating module. An xcaddy build with zero extractable
+#    modules fails outright (extraction evasion is indistinguishable from
+#    an intended plugin-less build, and this repo ships plugin builds);
+#  * matrix membership both ways: every dir is an exact matrix element and
+#    every matrix entry has a dir and a valid name; an empty matrix fails.
 PUBLISH=".github/workflows/publish-images.yaml"
-shopt -s nullglob
-IMG_DIRS=(images/*/)
 NAME_RE='^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*$'
+mapfile -t IMG_DIRS < <(find images -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+if [[ -d images && ${#IMG_DIRS[@]} -eq 0 ]]; then
+	echo "FAIL  images/ exists but contains no image directories"
+	fail=1
+fi
 if ((${#IMG_DIRS[@]})); then
 	matrix_ok=0
 	if [[ ! -f "$PUBLISH" ]]; then
@@ -132,11 +140,12 @@ if ((${#IMG_DIRS[@]})); then
 				fail=1
 			else
 				matrix_ok=1
-				# reverse membership: a matrix entry without a directory
-				# passes PR builds but breaks publish on main
 				while IFS= read -r m; do
 					[[ -n "$m" ]] || continue
-					if [[ ! -d "images/$m" ]]; then
+					if ! [[ "$m" =~ $NAME_RE ]]; then
+						echo "FAIL  matrix entry '$m' is not a valid OCI image name"
+						fail=1
+					elif [[ ! -d "images/$m" ]]; then
 						echo "FAIL  matrix entry '$m' has no images/$m directory"
 						fail=1
 					fi
@@ -144,8 +153,9 @@ if ((${#IMG_DIRS[@]})); then
 			fi
 		fi
 	fi
-	for d in "${IMG_DIRS[@]}"; do
-		name="$(basename -- "$d")"
+	for dd in "${IMG_DIRS[@]}"; do
+		name="$(basename -- "$dd")"
+		d="$dd/"
 		dir_fail=0
 		if ! [[ "$name" =~ $NAME_RE ]]; then
 			echo "FAIL  images/$name: dir name must match $NAME_RE (GHCR/CI matrix safety)"
@@ -167,39 +177,54 @@ if ((${#IMG_DIRS[@]})); then
 			fi
 			# comments cannot satisfy a structural check
 			nocomment=$(grep -v '^[[:space:]]*#' "${d}Dockerfile")
-			if ! grep -qE '^FROM.*[$][{]CADDY_VERSION[}]' <<<"$nocomment"; then
+			# join line continuations so structural checks see logical lines
+			joined=$(sed -e ':a' -e '/\\$/N' -e 's/\\\n[[:space:]]*/ /' -e 'ta' <<<"$nocomment")
+			if ! grep -qiE '^[[:space:]]*FROM.*[$][{]CADDY_VERSION[}]' <<<"$joined"; then
 				echo "FAIL  images/$name: CADDY_VERSION not consumed by a FROM line — the pin is decoration"
 				dir_fail=1
 			fi
-			# every caddy base must ride the pin; a literal tag on any FROM
-			# is silent drift the builder-stage check would mask
-			if grep -qE '^FROM[[:space:]]+caddy:[0-9]' <<<"$nocomment"; then
-				echo "FAIL  images/$name: FROM pins a caddy base by literal version tag — use \${CADDY_VERSION}"
-				dir_fail=1
-			fi
+			# EVERY caddy base must ride the pin: any case, any registry
+			# prefix, no literal or floating tag
+			while IFS= read -r ref; do
+				[[ -n "$ref" ]] || continue
+				# shellcheck disable=SC2016  # literal ${CADDY_VERSION}, must not expand
+				if [[ "${ref,,}" =~ (^|.*/)caddy: ]] && [[ "$ref" != *'${CADDY_VERSION}'* ]]; then
+					echo "FAIL  images/$name: FROM base '$ref' is not riding \${CADDY_VERSION} — literal or floating caddy tags are silent drift"
+					dir_fail=1
+				fi
+			done < <(awk 'tolower($1) == "from" {
+					for (i = 2; i <= NF; i++) { if ($i !~ /^--/) { print $i; break } }
+				}' <<<"$joined")
 			if grep -qiE '^[[:space:]]*arg[[:space:]].*\\[[:space:]]*$' <<<"$nocomment"; then
 				echo "FAIL  images/$name: line-continued ARG declaration — the drift check cannot read it"
 				dir_fail=1
 			fi
-			# every ARG default declaration must equal VERSION (no silent skips)
-			while IFS= read -r ad; do
-				ad="${ad#*=}"
-				ad="${ad%$'\r'}"
-				ad=$(sed -E "s/[[:space:]]*(#.*)?$//; s/^[\"']//; s/[\"']$//" <<<"$ad")
-				if [[ "$ad" != "$v" ]]; then
-					echo "FAIL  images/$name: Dockerfile ARG default '$ad' != VERSION '$v'"
+			# every CADDY_VERSION= assignment must equal VERSION, including
+			# positions after the first in a multi-name ARG
+			while IFS= read -r assign; do
+				av="${assign#*=}"
+				av=$(sed -E "s/[\"']//g; s/[[:space:]]*(#.*)?$//" <<<"$av")
+				if [[ "$av" != "$v" ]]; then
+					echo "FAIL  images/$name: Dockerfile ARG default '$av' != VERSION '$v'"
 					dir_fail=1
 				fi
-			done < <(grep -iE '^[[:space:]]*arg[[:space:]]+CADDY_VERSION=' <<<"$nocomment" || true)
-			# every xcaddy --with module must be explicitly pinned
+			done < <(grep -iE '^[[:space:]]*arg[[:space:]]' <<<"$nocomment" |
+				grep -oiE 'CADDY_VERSION=[^[:space:]]+' || true)
+			# every xcaddy --with module (on joined lines) must be @v-pinned
+			mod_count=0
 			while IFS= read -r mod; do
 				[[ -n "$mod" ]] || continue
-				if [[ "$mod" != *@v* ]]; then
+				mod_count=$((mod_count + 1))
+				if ! [[ "$mod" =~ @v[0-9] ]]; then
 					echo "FAIL  images/$name: xcaddy module '$mod' is unpinned — rebuilds can change bytes"
 					dir_fail=1
 				fi
-			done < <(grep -oE -- '--with[[:space:]]+[^[:space:]\\]+' "${d}Dockerfile" |
+			done < <(grep -oE -- '--with[[:space:]]+[^[:space:]]+' <<<"$joined" |
 				sed -E 's/^--with[[:space:]]+//' || true)
+			if grep -qi xcaddy <<<"$joined" && ((mod_count == 0)); then
+				echo "FAIL  images/$name: xcaddy build with zero extractable --with modules (plugin-less or hidden by layout)"
+				dir_fail=1
+			fi
 		fi
 		if ((matrix_ok)) && ! grep -qxF -- "$name" <<<"$matrix_members"; then
 			echo "FAIL  images/$name not an exact element of the $PUBLISH image_name matrix — it would never publish"
