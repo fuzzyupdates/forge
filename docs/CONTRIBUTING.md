@@ -15,12 +15,14 @@ Checks, with pinned tool versions:
 | shellcheck | 0.11.0 | `*.sh` + bash-shebang files |
 | shfmt | 3.11.0 | formatting of the same files (gated on `-d`, never `-l`, which exits 0 while listing violations — a vacuous gate) |
 
-Pins live in three places that must change together: this table,
-`check.sh`'s error messages, and the install step in
-`.github/workflows/check.yml`.
+Pins live in two places that must change together: the table above, and the
+install step in `.github/workflows/check.yml` — which carries the pinned
+versions, their sha256 checksums, and post-install `--version` assertions so
+neither a replaced release asset nor a stale local binary can impersonate a
+pin.
 
 Install locally by downloading the pinned release binaries into
-`~/.local/bin` — same URLs as the CI install step; verify release checksums.
+`~/.local/bin` — same URLs and checksums as the CI install step.
 
 ## Gate self-test (run after editing check.sh)
 
@@ -46,6 +48,19 @@ rm _canary.sh
 printf 'name: c\non:\n  pull_request:\njobs:\n  x:\n    runs-on: nope\n    steps:\n      - run: echo hi\n' >.github/workflows/_canary.yml
 ./check.sh; test $? -eq 1                         # must FAIL
 rm .github/workflows/_canary.yml
+
+# matrix substring canary (the image name must be an EXACT matrix element;
+# 'caddy' is a substring of 'caddy-cloudflare' and must not ride along):
+mkdir -p images/caddy
+printf '2.11.7\n' >images/caddy/VERSION
+printf 'ARG CADDY_VERSION=2.11.7\nFROM caddy:${CADDY_VERSION}-alpine\n' >images/caddy/Dockerfile
+./check.sh; test $? -eq 1                         # must FAIL
+rm -rf images/caddy
+
+# ARG/VERSION drift canary (Dockerfile default must equal VERSION):
+sed -i 's/^ARG CADDY_VERSION=.*/ARG CADDY_VERSION=2.9.9/' images/caddy-cloudflare/Dockerfile
+./check.sh; test $? -eq 1                         # must FAIL
+git checkout -- images/caddy-cloudflare/Dockerfile
 
 ./check.sh                                        # green again
 ```

@@ -9,8 +9,17 @@ on:
 env:
   REGISTRY: ghcr.io
 
+# serialize publishes; a queued push must never be cancelled mid-flight
+concurrency:
+  group: publish-images
+  cancel-in-progress: false
+
 jobs:
   build-and-push:
+    # publish ONLY from main — this also blocks workflow_dispatch against an
+    # unreviewed branch, which would otherwise overwrite :latest with
+    # unreviewed content
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -21,24 +30,49 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Read version and prep metadata
         id: prep
+        env:
+          IMAGE_NAME: ${{ matrix.image_name }}
         run: |
-          V_CONTENT=$(tr -d '[:space:]' <"images/${{ matrix.image_name }}/VERSION")
-          echo "VERSION=${V_CONTENT}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$(tr -d '[:space:]' <"images/$IMAGE_NAME/VERSION")" >> "$GITHUB_OUTPUT"
           echo "REPO_LC=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push
-        uses: docker/build-push-action@v6
+      - name: Build (push:false — verify before anything lands in the registry)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./images/${{ matrix.image_name }}
+          build-args: |
+            CADDY_VERSION=${{ steps.prep.outputs.VERSION }}
+          push: false
+          load: true
+          tags: forge-publish-verify:${{ matrix.image_name }}
+
+      - name: Verify built binary reports the pinned version
+        env:
+          IMAGE_NAME: ${{ matrix.image_name }}
+          EXPECTED: ${{ steps.prep.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm --entrypoint caddy "forge-publish-verify:$IMAGE_NAME" version)
+          printf '%s\n' "$out"
+          first=$(head -n1 <<<"$out" | awk '{print $1}')
+          if [[ "$first" != "v$EXPECTED" ]]; then
+            echo "built binary reports '$first', want 'v$EXPECTED'" >&2
+            exit 1
+          fi
+
+      - name: Push (layers come from the verified build's cache)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ./images/${{ matrix.image_name }}
           build-args: |
