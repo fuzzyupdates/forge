@@ -60,80 +60,101 @@ line continuation, multi-name `ARG`), not just values — the corpus that
 proved every rule green still leaked a continuation-split `--with`.
 
 ```sh
-./check.sh                                        # must exit 0
-cp images/caddy-cloudflare/Dockerfile /tmp/df.snap
-cp .github/workflows/publish-images.yaml /tmp/pub.snap
+# This block is a script: run it with `set -euo pipefail` and it exits 0 only
+# if every canary fails with ITS OWN FAIL line and the final gate is green.
+set -euo pipefail
+DF=images/caddy-cloudflare/Dockerfile
+PUB=.github/workflows/publish-images.yaml
+cp "$DF" /tmp/df.snap; cp "$PUB" /tmp/pub.snap
 
-# bare-semver + canary dir:
+must_fail() { # $1 = FAIL substring the gate must print
+  local out rc=0
+  ./check.sh >/tmp/check.out 2>&1 || rc=$?
+  [[ $rc -ne 0 ]] || { echo "EXPECTED FAIL ('$1') but gate exited 0"; return 1; }
+  grep -qF -- "$1" /tmp/check.out || { echo "FAIL line missing: '$1'"; cat /tmp/check.out; return 1; }
+}
+must_pass() { ./check.sh; }
+restore() { cp /tmp/df.snap "$DF"; cp /tmp/pub.snap "$PUB"; }
+
+must_pass   # clean tree
+
 mkdir -p images/_gate_canary
 printf 'v9.9.9\n' >images/_gate_canary/VERSION
 printf 'FROM scratch\nADD . /\n' >images/_gate_canary/Dockerfile
-./check.sh 2>&1 | grep -q 'not bare semver'
+must_fail 'not bare semver'; must_fail 'not consumed by a FROM'
 rm -rf images/_gate_canary
 
-# shellcheck canary:
-printf '#!/usr/bin/env bash\nread foo\n' >_canary.sh   # SC2162
-./check.sh 2>&1 | grep -q 'SC2162'
-rm _canary.sh
+printf '#!/usr/bin/env bash\nread foo\n' >_canary.sh
+must_fail 'SC2162'; rm _canary.sh
 
-# actionlint canary:
 printf 'name: c\non:\n  pull_request:\njobs:\n  x:\n    runs-on: nope\n    steps:\n      - run: echo hi\n' >.github/workflows/_canary.yml
-./check.sh 2>&1 | grep -q 'nope'
-rm .github/workflows/_canary.yml
+must_fail 'nope'; rm .github/workflows/_canary.yml
 
-# matrix substring canary ('caddy' is a substring of 'caddy-cloudflare'):
-mkdir -p images/caddy
+mkdir -p images/caddy   # 'caddy' is a substring of 'caddy-cloudflare'
 printf '2.11.7\n' >images/caddy/VERSION
 printf 'ARG CADDY_VERSION=2.11.7\nFROM caddy:${CADDY_VERSION}-alpine\nRUN true --with pinned@v1.0.0\n' >images/caddy/Dockerfile
-./check.sh 2>&1 | grep -q 'not an exact element'
-rm -rf images/caddy
+must_fail 'not an exact element'; rm -rf images/caddy
 
-# ARG/VERSION drift canary:
-sed -i 's/^ARG CADDY_VERSION=.*/ARG CADDY_VERSION=2.9.9/' images/caddy-cloudflare/Dockerfile
-./check.sh 2>&1 | grep -q 'ARG default'
-cp /tmp/df.snap images/caddy-cloudflare/Dockerfile
+sed -i 's/^ARG CADDY_VERSION=.*/ARG CADDY_VERSION=2.9.9/' "$DF"
+must_fail 'ARG default'; restore
 
-# multi-name ARG drift canary:
-sed -i 's/^ARG CADDY_VERSION=.*/ARG BUILD_DATE=x CADDY_VERSION=2.9.9/' images/caddy-cloudflare/Dockerfile
-./check.sh 2>&1 | grep -q 'ARG default'
-cp /tmp/df.snap images/caddy-cloudflare/Dockerfile
+sed -i 's/^ARG CADDY_VERSION=.*/ARG BUILD_DATE=x CADDY_VERSION=2.9.9/' "$DF"
+must_fail 'ARG default'; restore
 
-# unpinned module canary:
-sed -i 's|cloudflare@v0.2.4|cloudflare|' images/caddy-cloudflare/Dockerfile
-./check.sh 2>&1 | grep -q 'is unpinned'
-cp /tmp/df.snap images/caddy-cloudflare/Dockerfile
+sed -i 's|cloudflare@v0.2.4|cloudflare|' "$DF"
+must_fail 'unpinned or replaced'; restore
 
-# continuation-split --with canary (the layout attack):
-python3 - <<'EOF'
-import pathlib
-p = pathlib.Path("images/caddy-cloudflare/Dockerfile")
-s = p.read_text().replace(
-    "    --with github.com/caddy-dns/cloudflare@v0.2.4 \\\n",
-    "    --with \\\n    github.com/caddy-dns/cloudflare \\\n")
-p.write_text(s)
-EOF
-./check.sh 2>&1 | grep -q 'is unpinned'
-cp /tmp/df.snap images/caddy-cloudflare/Dockerfile
+# continuation-split --with (the layout attack):
+python3 -c 'import pathlib; p=pathlib.Path("'"$DF"'"); s=p.read_text();
+p.write_text(s.replace("    --with github.com/caddy-dns/cloudflare@v0.2.4 \\\n",
+"    --with \\\n    github.com/caddy-dns/cloudflare \\\n"))'
+must_fail 'unpinned or replaced'; restore
 
-# floating / case / registry-prefix FROM canaries:
-sed -i 's|caddy:${CADDY_VERSION}-alpine|caddy:alpine|' images/caddy-cloudflare/Dockerfile
-./check.sh 2>&1 | grep -q 'not riding'
-cp /tmp/df.snap images/caddy-cloudflare/Dockerfile
-sed -i 's|FROM caddy:${CADDY_VERSION}-builder|from docker.io/library/caddy:2.11.7-builder|' images/caddy-cloudflare/Dockerfile
-./check.sh 2>&1 | grep -q 'not riding'
-cp /tmp/df.snap images/caddy-cloudflare/Dockerfile
+# blank line inside a continuation (Docker accepts it, naive joins do not):
+python3 -c 'import pathlib; p=pathlib.Path("'"$DF"'"); s=p.read_text();
+p.write_text(s.replace("    --with github.com/caddy-dns/cloudflare@v0.2.4 \\\n",
+"    --with github.com/caddy-dns/cloudflare@v0.2.4 \\\n    --with \\\n\n    github.com/evil/mod \\\n"))'
+must_fail 'unpinned or replaced'; restore
 
-# empty-matrix canary:
-sed -i 's/image_name: \[caddy-cloudflare\]/image_name: []/' .github/workflows/publish-images.yaml
-./check.sh 2>&1 | grep -q 'matrix is empty'
-cp /tmp/pub.snap .github/workflows/publish-images.yaml
+sed -i 's|cloudflare@v0.2.4|cloudflare@v0.2.4=github.com/evil/mod|' "$DF"
+must_fail 'unpinned or replaced'; restore
 
-# phantom matrix entry canary (reverse membership):
-sed -i 's/image_name: \[caddy-cloudflare\]/image_name: [caddy-cloudflare, phantom]/' .github/workflows/publish-images.yaml
-./check.sh 2>&1 | grep -q "matrix entry 'phantom'"
-cp /tmp/pub.snap .github/workflows/publish-images.yaml
+sed -i 's|caddy:${CADDY_VERSION}-alpine|caddy:alpine|' "$DF"
+must_fail 'not riding'; restore
 
-./check.sh                                        # green again
+sed -i 's|FROM caddy:${CADDY_VERSION}-builder|from caddy:${CADDY_VERSION}-builder|' "$DF"
+must_pass; restore   # lowercase, still riding: legal
+sed -i 's|FROM caddy:${CADDY_VERSION}-builder|from caddy:2.11.7-builder|' "$DF"
+must_fail 'not riding'; restore
+
+sed -i 's|FROM caddy:${CADDY_VERSION}-builder|FROM docker.io/library/caddy:2.11.7-builder|' "$DF"
+must_fail 'not riding'; restore
+
+sed -i 's|caddy:${CADDY_VERSION}-alpine|caddy@sha256:aaaa|' "$DF"
+must_fail 'not riding'; restore
+
+sed -i 's|FROM caddy:${CADDY_VERSION}-alpine|ARG BASE=whatever\nFROM ${BASE}|' "$DF"
+must_fail 'bare variable'; restore
+
+sed -i 's/image_name: \[caddy-cloudflare\]/image_name: []/' "$PUB"
+must_fail 'matrix is empty'; restore
+
+sed -i 's/image_name: \[caddy-cloudflare\]/image_name: [caddy-cloudflare, phantom]/' "$PUB"
+must_fail "matrix entry 'phantom'"; restore
+
+sed -i 's/image_name: \[caddy-cloudflare\]/image_name: [caddy-cloudflare, .]/' "$PUB"
+must_fail 'not a valid OCI image name'; restore
+
+mkdir -p images/.hidden   # local enumeration must match CI's find
+printf '2.11.7\n' >images/.hidden/VERSION
+printf 'ARG CADDY_VERSION=2.11.7\nFROM caddy:${CADDY_VERSION}-alpine\nRUN true --with pinned@v1.0.0\n' >images/.hidden/Dockerfile
+must_fail 'dir name must match'; rm -rf images/.hidden
+
+python3 -c 'import pathlib; p=pathlib.Path("'"$DF"'"); s=p.read_text();
+p.write_text(s.replace("    --with github.com/caddy-dns/cloudflare@v0.2.4 \\\n", ""))'
+must_fail 'zero extractable'; restore
+
+must_pass   # green again
 ```
 
 ## Bumping Caddy
@@ -161,7 +182,11 @@ cp /tmp/pub.snap .github/workflows/publish-images.yaml
 Anyone who can push a branch can potentially publish: a pushed workflow file
 runs with the permissions its own `permissions:` block asks for, so the
 `if: github.ref == 'refs/heads/main'` guard stops accidental
-`workflow_dispatch` against another branch — not a malicious pusher. If that
-ever matters the fix is repo settings (branch protection + deployment
-environments gating `packages: write`), not more in-repo comments. Owner's
-call; today the repo is a single-owner homelab tool.
+`workflow_dispatch` against another branch — not a malicious pusher.
+Environment protection does not close this either: it only applies to jobs
+that declare `environment:`, and a pushed workflow simply omits it. The real
+fix, if it ever matters, is at the registry/credential layer — remove the
+repo's Actions write role on the GHCR package and publish with an
+environment-scoped credential (GitHub App or fine-grained PAT) restricted to
+the `main` deployment branch. Owner's call; today the repo is a single-owner
+homelab tool.
