@@ -23,8 +23,10 @@ docker pull ghcr.io/fuzzyupdates/forge/caddy-cloudflare:2.11.7
 
 - `images/<name>/VERSION` pins the upstream Caddy release. CI passes it to the
   build as `CADDY_VERSION` and the published image is tagged with it.
-- DNS plugins are pinned too (`@v` on each xcaddy `--with` module), so the
-  same Caddy version always builds the same bytes.
+- DNS plugins are pinned too (`@v` on each xcaddy `--with` module), so
+  rebuilds never silently pull new plugin code. Base images are tag-pinned;
+  upstream tag rebuilds can still change bytes, so pin by digest if you need
+  strict immutability.
 - When Caddy releases, a bump PR changes `VERSION` (and the Dockerfile `ARG`
   default, which the gate keeps in sync). CI builds the image and verifies the
   built binary reports the pinned version and includes the DNS module; on

@@ -9,7 +9,9 @@ on:
 env:
   REGISTRY: ghcr.io
 
-# serialize publishes; a queued push must never be cancelled mid-flight
+# serialize publishes; a RUNNING publish is never cancelled (a queued one can
+# still be replaced by a newer push — for Caddy images the tip version is the
+# one that matters, and VERSION-tagged pushes keep history)
 concurrency:
   group: publish-images
   cancel-in-progress: false
@@ -31,9 +33,11 @@ jobs:
         run: ./check.sh
 
   build-and-push:
-    # publish ONLY from main. NOTE: workflow_dispatch snapshots the workflow
-    # from the dispatched ref — this ref check, not the trigger, is what keeps
-    # a dispatch against an unreviewed branch from overwriting :latest.
+    # publish ONLY from main. This ref check stops an accidental
+    # workflow_dispatch against another branch; it is NOT a defense against a
+    # malicious pusher — a pushed workflow file runs with the permissions its
+    # own `permissions:` block asks for. See the trust model in
+    # docs/CONTRIBUTING.md.
     needs: gate
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -89,7 +93,7 @@ jobs:
             exit 1
           fi
           mods=$(docker run --rm --entrypoint caddy "forge-publish-verify:$IMAGE_NAME" list-modules)
-          grep -qx 'dns.providers.cloudflare' <<<"$mods"
+          grep -qxF 'dns.providers.cloudflare' <<<"$mods"
 
       - name: Push the verified artifact
         env:
@@ -102,7 +106,9 @@ jobs:
           # publish a fresh build, not the one that was verified
           src="forge-publish-verify:$IMAGE_NAME"
           dst="$REGISTRY/$REPO_LC/forge/$IMAGE_NAME"
-          docker tag "$src" "$dst:latest"
           docker tag "$src" "$dst:$VERSION"
-          docker push "$dst:latest"
+          docker tag "$src" "$dst:latest"
+          # version tag first: if a push fails mid-way, :latest never points
+          # at content that lacks its version tag
           docker push "$dst:$VERSION"
+          docker push "$dst:latest"

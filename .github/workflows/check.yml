@@ -11,9 +11,11 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # a superseded PR gate may cancel; a main-push gate never cancels already
-  # running work, but queued runs are replaced (every "real" main commit is
-  # expected to land via a checked PR, so the last run records the outcome)
+  # PR gates may cancel superseded runs. On main, running gate jobs are never
+  # cancelled and a queued job may still be replaced by a newer push —
+  # acceptable because the gate re-runs on publish anyway, so the tip commit
+  # always gets a recorded result (main may legitimately receive direct
+  # owner pushes, see README)
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -118,4 +120,4 @@ jobs:
           mods=$(docker run --rm --entrypoint caddy "forge-pr-check:$IMAGE_NAME" list-modules)
           # a silently dropped DNS plugin still builds and still reports the
           # right version — the whole point of this image is the module
-          grep -qx 'dns.providers.cloudflare' <<<"$mods"
+          grep -qxF 'dns.providers.cloudflare' <<<"$mods"
