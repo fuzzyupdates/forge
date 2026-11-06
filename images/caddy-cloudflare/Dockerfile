@@ -1,5 +1,5 @@
 # images/caddy-cloudflare/Dockerfile
-ARG CADDY_VERSION=2.11.8
+ARG CADDY_VERSION=2.11.9
 
 # Stage 1: Build
 FROM caddy:${CADDY_VERSION}-builder AS builder
